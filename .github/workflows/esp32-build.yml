@@ -1,0 +1,97 @@
+name: Build ESP32 firmware
+
+on:
+  workflow_dispatch:
+    inputs:
+      board:
+        description: "PlatformIO board id"
+        default: "esp32dev"
+        required: false
+      wifi_ssid:
+        description: "WiFi SSID to bake into the firmware (optional)"
+        required: false
+      wifi_password:
+        description: "WiFi password to bake into the firmware (optional)"
+        required: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout bareiron
+        uses: actions/checkout@v4
+        with:
+          path: bareiron
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v1
+        with:
+          bun-version: latest
+
+      - name: Set up Python (for PlatformIO)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Install PlatformIO
+        run: pip install -U platformio --break-system-packages
+
+      - name: Install JDK 24
+        run: |
+          curl -LO https://download.java.net/java/GA/jdk24.0.2/fdc5d0102fe0414db21410ad5834341f/12/GPL/openjdk-24.0.2_linux-x64_bin.tar.gz
+          tar -xzf openjdk-24.0.2_linux-x64_bin.tar.gz
+
+      - name: Dump Minecraft server registries
+        working-directory: bareiron
+        run: |
+          mkdir -p notchian
+          cd notchian
+          curl -Lo server.jar https://piston-data.mojang.com/v1/objects/6bce4ef400e4efaa63a13d5e6f6b500be969ef81/server.jar
+          echo "eula=true" > eula.txt
+          ../../jdk-24.0.2/bin/java -DbundlerMainClass="net.minecraft.data.Main" -jar server.jar --all
+
+      - name: Generate registry headers
+        working-directory: bareiron
+        run: bun run build_registries.js
+
+      - name: Set WiFi credentials
+        if: ${{ github.event.inputs.wifi_ssid != '' }}
+        working-directory: bareiron
+        run: |
+          sed -i "s/#define WIFI_SSID .*/#define WIFI_SSID \"${{ github.event.inputs.wifi_ssid }}\"/" include/globals.h
+          sed -i "s/#define WIFI_PASS .*/#define WIFI_PASS \"${{ github.event.inputs.wifi_password }}\"/" include/globals.h
+
+      - name: Scaffold PlatformIO project
+        run: |
+          mkdir -p esp32-project
+          pio project init --board "${{ github.event.inputs.board || 'esp32dev' }}" \
+            --project-dir esp32-project -O "framework = espidf"
+          rm -rf esp32-project/include esp32-project/src
+          cp -r bareiron/include esp32-project/include
+          cp -r bareiron/src esp32-project/src
+          cat >> esp32-project/platformio.ini <<'EOF'
+          build_flags =
+              -Wno-error=implicit-fallthrough
+          EOF
+
+      - name: Build firmware
+        working-directory: esp32-project
+        run: pio run
+
+      - name: Collect binaries
+        run: |
+          mkdir -p dist
+          find esp32-project/.pio/build -name "bootloader.bin" -exec cp {} dist/ \;
+          find esp32-project/.pio/build -name "partitions.bin" -exec cp {} dist/ \;
+          find esp32-project/.pio/build -name "firmware.bin" -exec cp {} dist/ \;
+
+      - name: Publish binaries to build branch
+        run: |
+          cd dist
+          git init -q
+          git config user.name "bareiron-ci"
+          git config user.email "ci@users.noreply.github.com"
+          git checkout -q -b esp32-build-output
+          git add bootloader.bin partitions.bin firmware.bin
+          git commit -q -m "ESP32 build output ($(date -u +%Y-%m-%dT%H:%M:%SZ))"
+          git push -q -f "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" esp32-build-output
